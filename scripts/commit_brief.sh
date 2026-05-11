@@ -55,7 +55,7 @@ trap 'rm -rf "$WORKDIR"' EXIT
 echo "[commit] cloning $(echo "$GITHUB_REMOTE" | sed -E 's|x-access-token:[^@]+@|x-access-token:<redacted>@|') into temp dir"
 # Disable interactive auth prompts so bad creds fail fast.
 export GIT_TERMINAL_PROMPT=0
-if ! timeout 60 git clone --depth=1 --quiet "$GITHUB_REMOTE" "$WORKDIR/repo" 2>&1; then
+if ! timeout 60 git clone --quiet "$GITHUB_REMOTE" "$WORKDIR/repo" 2>&1; then
   echo "error: git clone failed — check PAT and that the repo exists." >&2
   exit 5
 fi
