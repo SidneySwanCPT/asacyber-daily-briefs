@@ -1,22 +1,13 @@
 #!/usr/bin/env bash
 # commit_brief.sh — commit a finished brief and push to GitHub.
 #
-# This is the sandbox-side half of the publish pipeline. It does NOT send
-# email. The email is sent by the GitHub Actions workflow at
-# .github/workflows/email-brief.yml, which fires on push of any briefs/*.md.
-#
-# Why split? Claude's scheduled-task bash sandbox has a narrow outbound
-# allowlist (github.com works, api.resend.com is blocked). Doing the push
-# here and the email on GitHub's runners gets both halves into networks
-# that can reach what they need.
+# The local Daily/.git is intentionally NOT used. The scheduled-task sandbox
+# can write into Daily/.git but cannot delete files there, which leaves
+# stale index.lock files that brick subsequent runs. So instead we clone
+# the remote fresh into /tmp each invocation, drop the new brief in, and
+# push from /tmp where there are no permission quirks.
 #
 # Usage:  scripts/commit_brief.sh briefs/YYYY-MM-DD_daily_intel_brief.md
-#
-# Loaded env vars (from .config/secrets.env):
-#   GITHUB_REMOTE     — required. HTTPS URL with embedded token, e.g.
-#                       https://x-access-token:GITHUB_PAT@github.com/USER/REPO.git
-#   GIT_AUTHOR_NAME   — optional, defaults to "ASA Cyber Brief Bot"
-#   GIT_AUTHOR_EMAIL  — optional, defaults to "briefs@asacyber.local"
 
 set -euo pipefail
 
@@ -36,26 +27,19 @@ if [[ ! -f "$BRIEF_MD" ]]; then
 fi
 
 BRIEF_MD_ABS="$(cd "$(dirname "$BRIEF_MD")" && pwd)/$(basename "$BRIEF_MD")"
+BRIEF_BASENAME="$(basename "$BRIEF_MD_ABS")"
 DATE_STAMP="$(date +%Y-%m-%d)"
 
-# --------------------------------------------------------------------------- #
-# Load secrets
-# --------------------------------------------------------------------------- #
 if [[ ! -f "$SECRETS_FILE" ]]; then
   echo "error: secrets file missing at $SECRETS_FILE" >&2
-  echo "       copy .config/secrets.env.template to .config/secrets.env and fill in keys." >&2
   exit 3
 fi
 # shellcheck disable=SC1090
-set -a
-source "$SECRETS_FILE"
-set +a
+set -a; source "$SECRETS_FILE"; set +a
 
-if [[ -z "${GITHUB_REMOTE:-}" ]]; then
-  echo "error: GITHUB_REMOTE is empty in $SECRETS_FILE" >&2
-  echo "       set it to an HTTPS push URL with an embedded PAT, e.g." >&2
-  echo "       GITHUB_REMOTE=\"https://x-access-token:ghp_xxx@github.com/USER/REPO.git\"" >&2
-  echo "       see SETUP_GITHUB_ACTIONS.md for details." >&2
+if [[ -z "${GITHUB_REMOTE:-}" || "$GITHUB_REMOTE" == *"__PASTE_PAT_HERE__"* ]]; then
+  echo "error: GITHUB_REMOTE is empty or still has the PAT placeholder." >&2
+  echo "       see SETUP_GITHUB_ACTIONS.md for setup." >&2
   exit 4
 fi
 
@@ -63,63 +47,41 @@ GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-ASA Cyber Brief Bot}"
 GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-briefs@asacyber.local}"
 
 # --------------------------------------------------------------------------- #
-# Init / repair the local repo
+# Clone fresh into a temp dir, push from there.
 # --------------------------------------------------------------------------- #
-cd "$ROOT_DIR"
+WORKDIR="$(mktemp -d -t commit_brief.XXXXXX)"
+trap 'rm -rf "$WORKDIR"' EXIT
 
-if [[ ! -d .git ]]; then
-  echo "[commit] initializing git repo"
-  git init -q
-  git branch -m main 2>/dev/null || true
+echo "[commit] cloning $(echo "$GITHUB_REMOTE" | sed -E 's|x-access-token:[^@]+@|x-access-token:<redacted>@|') into temp dir"
+# Disable interactive auth prompts so bad creds fail fast.
+export GIT_TERMINAL_PROMPT=0
+if ! timeout 60 git clone --depth=1 --quiet "$GITHUB_REMOTE" "$WORKDIR/repo" 2>&1; then
+  echo "error: git clone failed — check PAT and that the repo exists." >&2
+  exit 5
 fi
 
-# Make sure origin points where we expect.
-if git remote get-url origin >/dev/null 2>&1; then
-  CURRENT_URL="$(git remote get-url origin)"
-  if [[ "$CURRENT_URL" != "$GITHUB_REMOTE" ]]; then
-    git remote set-url origin "$GITHUB_REMOTE"
-    echo "[commit] updated origin remote URL"
-  fi
-else
-  git remote add origin "$GITHUB_REMOTE"
-  echo "[commit] added origin remote"
-fi
-
+cd "$WORKDIR/repo"
 git config user.name  "$GIT_AUTHOR_NAME"
 git config user.email "$GIT_AUTHOR_EMAIL"
 
-# Make sure the brief is inside the repo's briefs/ folder.
-case "$BRIEF_MD_ABS" in
-  "$ROOT_DIR"/briefs/*) ;;
-  *)
-    echo "error: brief must live under $ROOT_DIR/briefs/  (got $BRIEF_MD_ABS)" >&2
-    exit 5
-    ;;
-esac
+# Drop today's brief in.
+mkdir -p briefs
+cp "$BRIEF_MD_ABS" "briefs/$BRIEF_BASENAME"
 
-# --------------------------------------------------------------------------- #
-# Stage + commit
-# --------------------------------------------------------------------------- #
-git add briefs/ scripts/ .github/ README.md .gitignore .config/secrets.env.template SETUP_GITHUB_ACTIONS.md 2>/dev/null || true
-
+git add "briefs/$BRIEF_BASENAME"
 if git diff --cached --quiet; then
-  echo "[commit] nothing new to commit"
-else
-  git commit -q -m "Daily intel brief: $DATE_STAMP"
-  echo "[commit] committed $DATE_STAMP"
+  echo "[commit] brief is already committed and unchanged — nothing to push"
+  exit 0
 fi
 
-# --------------------------------------------------------------------------- #
-# Push
-# --------------------------------------------------------------------------- #
+git commit -q -m "Daily intel brief: $DATE_STAMP"
+echo "[commit] committed $DATE_STAMP locally in $WORKDIR/repo"
+
 echo "[commit] pushing to origin/main"
-if git push -u origin main 2>&1; then
-  echo "[commit] pushed OK — GitHub Actions will send the email"
-else
+if ! timeout 60 git push --quiet origin main 2>&1; then
   PUSH_EXIT=$?
-  echo "[commit] WARN: git push failed (exit $PUSH_EXIT)" >&2
-  echo "         check that GITHUB_REMOTE has a valid PAT and the repo exists." >&2
+  echo "error: git push failed (exit $PUSH_EXIT)" >&2
   exit $PUSH_EXIT
 fi
 
-echo "[commit] DONE"
+echo "[commit] pushed OK — GitHub Actions will send the email"
