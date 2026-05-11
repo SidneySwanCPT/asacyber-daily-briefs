@@ -1,0 +1,12 @@
+# Secrets — NEVER commit
+.config/secrets.env
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Local-only outputs (keep markdown + pdf in briefs/, ignore everything else)
+*.log
+.cache/

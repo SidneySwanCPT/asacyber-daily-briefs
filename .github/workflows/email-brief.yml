@@ -1,0 +1,168 @@
+name: Email daily intel brief
+
+# Fires whenever a new (or updated) brief is pushed under briefs/.
+# Runs on GitHub-hosted runners which have full outbound internet, so the
+# Resend API is reachable from here (it isn't from Claude's sandbox).
+
+on:
+  push:
+    paths:
+      - 'briefs/*.md'
+  workflow_dispatch:
+    inputs:
+      brief_path:
+        description: 'Path to brief markdown (relative to repo root). Defaults to today.'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  send-email:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Install pandoc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pandoc
+
+      - name: Resolve brief path
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ github.event.inputs.brief_path }}" ]]; then
+            BRIEF="${{ github.event.inputs.brief_path }}"
+          else
+            # On push: take the newest briefs/*.md from this commit.
+            BRIEF="$(git diff-tree --no-commit-id --name-only -r ${{ github.sha }} \
+                       | grep '^briefs/.*\.md$' \
+                       | sort | tail -n1 || true)"
+            if [[ -z "$BRIEF" ]]; then
+              # Fallback: pick today's brief by date.
+              BRIEF="briefs/$(date -u +%Y-%m-%d)_daily_intel_brief.md"
+            fi
+          fi
+          if [[ ! -f "$BRIEF" ]]; then
+            echo "error: brief file not found: $BRIEF" >&2
+            exit 1
+          fi
+          echo "brief=$BRIEF" >> "$GITHUB_OUTPUT"
+          echo "date_stamp=$(basename "$BRIEF" | cut -c1-10)" >> "$GITHUB_OUTPUT"
+          echo "resolved brief: $BRIEF"
+
+      - name: Render markdown to inline-styled HTML
+        id: render
+        env:
+          BRIEF_PATH: ${{ steps.resolve.outputs.brief }}
+        run: |
+          set -euo pipefail
+          # Drop the first H1 so we don't double the title in the email shell.
+          BODY_MD="$(awk 'NR==1 && /^# / {next} {print}' "$BRIEF_PATH")"
+          RAW_HTML="$(printf '%s\n' "$BODY_MD" | pandoc -f markdown -t html5 --wrap=none)"
+
+          export RAW_HTML
+          STYLED_HTML="$(python3 - <<'PY'
+          import os, re
+          html = os.environ['RAW_HTML']
+          INLINES = {
+            'h2': "font-size:19px; margin:32px 0 12px; padding-bottom:6px; border-bottom:1px solid #eaeaea; line-height:1.3; color:#0a0a0a; font-weight:700;",
+            'h3': "font-size:17px; margin:26px 0 10px; padding:4px 0 4px 12px; line-height:1.3; color:#0a0a0a; font-weight:700; border-left:3px solid #1158c7; background:#f6f9ff;",
+            'h4': "font-size:21px; margin:32px 0 8px; padding:0 0 6px; line-height:1.3; color:#0a0a0a; font-weight:800; border-bottom:2px solid #1158c7;",
+            'p':  "font-size:15px; line-height:1.65; margin:16px 0; color:#1a1a1a;",
+            'li': "font-size:15px; line-height:1.55; margin-bottom:6px; color:#1a1a1a;",
+          }
+          for tag, style in INLINES.items():
+            pattern = re.compile(r'<' + tag + r'(\s[^>]*)?>')
+            def repl(m, _s=style, _t=tag):
+              attrs = m.group(1) or ''
+              if 'style=' in attrs:
+                return m.group(0)
+              return f'<{_t}{attrs} style="{_s}">'
+            html = pattern.sub(repl, html)
+          print(html)
+          PY
+          )"
+
+          EMAIL_HTML=$(cat <<HTML
+          <!DOCTYPE html>
+          <html>
+          <head><meta charset="utf-8"></head>
+          <body style="margin:0; padding:0; background:#ffffff; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; color:#1a1a1a;">
+          <style>
+            .brief-wrap { max-width: 720px; margin: 0 auto; padding: 32px 24px; background: #ffffff; }
+            .brief-wrap h1 { font-size: 24px; margin: 0 0 4px; line-height: 1.25; }
+            .brief-wrap a { color: #1158c7; text-decoration: underline; }
+            .brief-wrap hr { border: none; border-top: 1px solid #eaeaea; margin: 28px 0; }
+            .brief-wrap strong { color: #0a0a0a; }
+            .brief-footer { color: #8a8a90; font-size: 12px; padding: 18px 24px; text-align: center; }
+          </style>
+          <div class="brief-wrap">
+            <h1>Daily Cybersecurity Intel Brief</h1>
+            $STYLED_HTML
+          </div>
+          <div class="brief-footer">
+            Automated daily brief &middot; sources cited inline above
+          </div>
+          </body>
+          </html>
+          HTML
+          )
+
+          # Stash via a file so we don't have to escape it for outputs.
+          printf '%s' "$EMAIL_HTML" > /tmp/email.html
+
+          # Lead title for unique subject (prevents email threading).
+          LEAD="$(awk '
+            /^## Top-line takeaways/ { in_s=1; next }
+            in_s && /^## / && !/^## Top-line takeaways/ { in_s=0 }
+            in_s && /^### / { sub(/^### /, ""); print; exit }
+          ' "$BRIEF_PATH")"
+          if [[ -n "$LEAD" ]]; then
+            SUBJ="Daily Cyber Brief — ${{ steps.resolve.outputs.date_stamp }} — $LEAD"
+          else
+            SUBJ="Daily Cyber Brief — ${{ steps.resolve.outputs.date_stamp }}"
+          fi
+          echo "subject=$SUBJ" >> "$GITHUB_OUTPUT"
+
+      - name: Send via Resend
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM:    ${{ secrets.RESEND_FROM }}
+          RESEND_TO:      ${{ secrets.RESEND_TO }}
+          SUBJECT:        ${{ steps.render.outputs.subject }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RESEND_API_KEY:-}" || -z "${RESEND_FROM:-}" || -z "${RESEND_TO:-}" ]]; then
+            echo "error: one of RESEND_API_KEY / RESEND_FROM / RESEND_TO is missing from repo Secrets" >&2
+            exit 1
+          fi
+
+          PAYLOAD="$(python3 - <<'PY'
+          import json, os
+          html = open('/tmp/email.html').read()
+          print(json.dumps({
+            "from": os.environ['RESEND_FROM'],
+            "to":   [os.environ['RESEND_TO']],
+            "subject": os.environ['SUBJECT'],
+            "html": html,
+            "headers": { "X-Entity-Ref-ID": f"asacyber-daily-{os.environ['SUBJECT']}" },
+          }))
+          PY
+          )"
+
+          RESP="$(curl -sS -w '\n%{http_code}' \
+            -X POST 'https://api.resend.com/emails' \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD")"
+
+          CODE="$(printf '%s' "$RESP" | tail -n1)"
+          BODY="$(printf '%s' "$RESP" | sed '$d')"
+          echo "resend http $CODE: $BODY"
+          if [[ "$CODE" != "200" ]]; then
+            echo "::error::Resend send failed (HTTP $CODE)"
+            exit 1
+          fi
